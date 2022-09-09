@@ -1,0 +1,191 @@
+---
+title: "Analysis of mature microRNA data"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Set the path to data directory
+```{r}
+root = "./data/"
+```
+
+Upload miRNA data
+```{r}
+DEA_miRNA = read.csv(paste(root, "miRNA.DEA.csv.gz", sep = "")) %>%
+            mutate(transition = factor(transition,
+                                       levels = c("NPC/iPS", "Neu/NPC", "Neu/iPS")))
+miRNA = read.csv(paste(root, "miRNA.collapsed_to_mature.csv.gz", sep = ""))
+```
+
+Annotate spike-ins
+```{r}
+DEA_miRNA = DEA_miRNA %>%
+            mutate(endogenous = !grepl("Un", Mature),
+                   endogenous = factor(endogenous, levels=c(T, F)))
+```
+
+Visualize endogenous and spike-in microRNA fold-changes
+```{r}
+ggplot(data = DEA_miRNA,
+       aes(x = endogenous,
+           y = log2FC,
+           fill = endogenous)) +
+  geom_boxplot(notch = T,
+               outlier.size = 0.1) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#BFBFBF", "#5D3FD3")) +
+  coord_cartesian(ylim = c(-1.7, 1.7)) +
+  ylab(latex2exp::TeX("fold-change, $log_{2}$")) +
+  facet_wrap(~transition) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        plot.background = element_rect(fill = "white", colour = "white", size = 1))
+
+
+correction_factor = DEA_miRNA %>%
+                      filter(endogenous == F) %>%
+                      group_by(transition) %>%
+                      summarise(correction_factor = -median(log2FC, na.rm = T))
+ggplot(data = DEA_miRNA %>%
+              filter(endogenous == T) %>% 
+              left_join(correction_factor) %>%
+              mutate(transition = factor(transition,
+                                         levels = c("NPC/iPS", "Neu/NPC", "Neu/iPS"))),
+       aes(y = log2FC + correction_factor)) +
+  geom_boxplot(notch = T, fill = "#5D3FD3", alpha = 0.5,
+               outlier.size = 0.1) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#BFBFBF", "#FF0019")) +
+  coord_cartesian(ylim = c(-2, 4.3)) +
+  ylab(latex2exp::TeX("fold-change, $log_{2}$")) +
+  facet_wrap(~transition) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+```
+
+
+```{r}
+get_density <- function(x, y, n = 100) {
+  dens <- MASS::kde2d(x = x, y = y, n = n)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+celltypesA = c("iPS", "NPC")
+celltypesB = c("NPC", "Neu")
+for (ind in c(1:2)) {
+  celltypeA = celltypesA[ind]
+  celltypeB = celltypesB[ind] 
+  step = paste(celltypeB, celltypeA, sep = "/")
+  
+  graph_tbl = DEA_miRNA %>% 
+              mutate(gene = Mature) %>%
+              filter(transition == step,
+                     is.finite(log2FC)) %>%
+              select(gene, padj, baseMean, log2FC) %>%
+              na.omit() %>%
+              mutate(padj_score = -log(padj, 10),
+                     padj_score = ifelse(padj_score > 30, 30, padj_score),
+                     gene = gsub("hsa-", "", gene))
+  
+  graph_subset = data.frame(baseMean = 10,
+                            log2FC = 0,
+                            padj_score = 10,
+                            gene = "X")
+  alpha = 0
+  axis_max = 15.5
+  if (celltypeB == "NPC") {
+    mirnas = "miR-302a-3p|miR-200b-3p|miR-96-5p|miR-371a-5p|miR-135a-3p|miR-125b-5p|let-7i-3p|miR-9-5p"
+    graph_subset = graph_tbl %>%
+                   filter(grepl(mirnas, gene)) %>%
+                   mutate(panel_color = ifelse(log2FC > 0,
+                                               "#FF0000", "#00FF95"))
+    alpha = 1
+  }
+  if (celltypeB == "Neu") {
+    mirnas = "miR-7-5p|miR-137-3p|miR-124-3p|miR-132-3p|miR-20b-5p|miR-92b-3p|miR-148a-5p|miR-106a-3p"
+    graph_subset = graph_tbl %>%
+                   filter(grepl(mirnas, gene)) %>%
+                   mutate(panel_color = ifelse(log2FC > 0,
+                                               "#0092FF", "#FF0000"))
+    alpha = 1
+  }
+  
+  
+  output = paste("~/OneDrive - SickKids/APA_stability/subprojects/github/deltaMIR_", celltypeB, "_vs_", celltypeA, ".pdf", sep = "")
+  ggplot(data = graph_tbl,
+         aes(x = log(baseMean, 10),
+             y = log2FC,
+             color = padj_score)) +
+    geom_point(size = 1.5) +
+    geom_point(data = graph_subset,
+               pch = 21, color = "black", size = 1.5,
+               fill = graph_subset$panel_color,
+               alpha = alpha) +
+    ggrepel::geom_text_repel(data = graph_subset,
+                             aes(label = gene),
+                             bg.color = "black", bg.r = 0.025,
+                             color = graph_subset$panel_color, size = 4,
+                             alpha = alpha) +
+    ggthemes::theme_base() +
+    scale_color_gradient(low = "grey", high = "#5D3FD3") +
+    coord_cartesian(ylim = c(-axis_max, axis_max),
+                    xlim = c(0, 6.45)) +
+    xlab(latex2exp::TeX(paste("average abundance, ($log_{10}$)", sep = " "))) +
+    ylab(latex2exp::TeX(paste(celltypeB, celltypeA, ", ($log_{2}$)", sep = " "))) +
+    theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+    ggsave(output, 
+           width = 5.15, height = 3.5,
+           useDingbats = F)
+}
+```
+
+Analysis of AGO2 RIP-qRT-PCR data
+```{r}
+ago_data = read.csv("~/OneDrive - SickKids/APA_stability/subprojects/github/data/AGO2_RIP_qRT_PCR_reformatted.csv", 
+                    header=T)[,c(1:5)]
+ago_data = reshape2::melt(ago_data) %>%
+           group_by(gene, isoform, celltype, variable) %>%
+           summarise(value_avg = mean(value),
+                     value_sd = sd(value)/sqrt(2))
+
+output = "~/OneDrive - SickKids/APA_stability/subprojects/github/AGO2_RT_qPCR.pdf"
+ggplot(data = ago_data %>%
+              filter(isoform=="total"),
+       aes(x = variable,
+           y = value_avg,
+           group = celltype,
+           fill = celltype)) +
+  geom_bar(stat = "identity", position=position_dodge()) +
+  geom_errorbar(aes(ymin = value_avg - value_sd,
+                    ymax = value_avg + value_sd),
+                position=position_dodge(0.9), width = 0.75) +
+  facet_grid(~gene) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#00FF95", "#0092FF")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        plot.background = element_rect(fill = "white",
+                                       colour = "white",
+                                       size = 1),
+        axis.title.x=element_blank()) +
+  ylab("Fold Enrichment") 
+  ggsave(output, width = 5, height = 3)
+```
+
+
+

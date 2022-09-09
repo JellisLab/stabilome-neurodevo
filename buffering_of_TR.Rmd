@@ -1,0 +1,342 @@
+---
+title: "Buffering of transcription rate shifts"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Current approach in the estimate of transcription rate (TR) shifts buffering suffers from the interdependence of TR and half-life (HL) measurement. Indeed, the denominator in a ratio method is TR itself.
+
+Denote measured TR and steady-state (SS) log2 fold-change as logT and logS. Similarly denote real TR and steady-state (SS) log2 fold-change as logT_r and logS_r. Finally, let N_t and N_s be noise components for the TR and SS respectivelty. Then:
+
+logT = logT_r + N_t
+logS = logS_r + N_s
+
+Estimated HL log2 fold-change logHL is:
+logHL = logS - logT = (logS_r - logT_r) + (N_s - N_t) = logHL_r + (N_s - N_t)
+
+Then, in a heatmap we look at a comparison between logT and logHL. There are two main regimes.
+
+A) Noise is bigger than a real signal (N_s - N_t >> logHL_r & N_t >> logT_r). Then we basically compare:
+N_t vs (N_s - N_t)
+In this case, a noise induced negative relation between TR and HL changes will be observed.
+
+B) Signal is bigger than noise (logT_r and logHL_r dominates).
+Then, we observe true signal logT_r vs logHL_r
+
+A clean description of buffering would combine "pulse and chase" approach of HL measurement (when decay of labeled mRNAs is observed) with our current approach of TR measerement.
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Set the path to data directory
+```{r}
+root = "./data/"
+```
+
+Upload transcription rate, steady state and half-life data
+```{r}
+TR_raw = read.csv(paste(root, "TR_log2FC_deseq2.csv.gz", sep = ""), header = T)
+SS_raw = read.csv(paste(root, "SS_log2FC_deseq2.csv.gz", sep = ""), header = T)
+
+differentiation_step = "NPC_iPS"
+
+# We also tried to estimate SS/TR fold change with a DESeq2
+# from interaction term celltype:assay in a design:
+# ~ celltype + replicate + assay + celltype:assay
+# Here assay is a factor with values c(SS, TR)
+SS_TR_raw = read.csv(paste(root, "SS_TR_deseq2.csv.gz", sep = ""), header = T)
+
+SS_TR_tbl = rbind(SS_TR_raw %>% 
+                    mutate(log2FC_SS_TR = log2_SS_TR_NPC_WT - log2_SS_TR_iPS_WT,
+                           transition = "NPC_iPS"),
+                  SS_TR_raw %>% 
+                    mutate(log2FC_SS_TR = log2_SS_TR_Neu_WT - log2_SS_TR_NPC_WT,
+                           transition = "Neu_NPC")) %>%
+            filter(transition == differentiation_step) %>%
+            select(gene, log2FC_SS_TR)
+
+
+normed_avg_tbl = read.csv(paste(root, "normed_avg_counts.csv.gz", sep = ""), header = T) %>%
+                 select(gene, contains("SS"))
+```
+
+Define thresholds for a sufficient log2FC
+```{r}
+TR_tbl = TR_raw 
+colnames(TR_tbl) = gsub(differentiation_step, "TR", colnames(TR_tbl))
+TR_tbl = TR_tbl %>%
+         mutate(padj_TR = ifelse(is.na(padj_TR), 1, padj_TR),
+                TR_status = "Not",
+                TR_status = ifelse(log2FC_TR > 0 & padj_TR < 0.1,
+                                       "Up", TR_status),
+                TR_status = ifelse(log2FC_TR < 0 & padj_TR < 0.1,
+                                       "Down", TR_status)) %>%
+         select(gene, log2FC_TR, TR_status)
+
+SS_tbl = SS_raw 
+colnames(SS_tbl) = gsub(differentiation_step, "SS", colnames(SS_tbl))
+SS_tbl = SS_tbl %>%
+         mutate(padj_SS = ifelse(is.na(padj_SS), 1, padj_SS),
+                SS_status = "Not",
+                SS_status = ifelse(log2FC_SS > 0 & padj_SS < 0.1,
+                                       "Up", SS_status),
+                SS_status = ifelse(log2FC_SS < 0 & padj_SS < 0.1,
+                                       "Down", SS_status)) %>%
+         select(gene, log2FC_SS, SS_status)
+
+RATE_tbl = full_join(TR_tbl, SS_tbl) %>%
+           select(gene, log2FC_TR, log2FC_SS, TR_status, SS_status)
+```
+
+Tidy log2FC data for a heatmap
+```{r}
+RATE_clean = RATE_tbl %>%
+              mutate(TR_na = is.na(log2FC_TR),
+                     SS_na = is.na(log2FC_SS),
+                     log2FC_SS = ifelse(SS_na & !TR_na,
+                                        0, log2FC_SS),
+                     SS_status = ifelse(SS_na & !TR_na,
+                                            "Not", SS_status),
+                     log2FC_TR = ifelse(TR_na & !SS_na,
+                                        0, log2FC_TR),
+                     TR_status = ifelse(TR_na & !SS_na,
+                                            "Not", TR_status)) %>%
+              na.omit() %>%
+              filter(TR_status != "Not" | 
+                     SS_status != "Not") %>%
+              # Reduce fold-change value by 1/2 for visual purpose
+              mutate(log2FC_TR = ifelse(TR_status == "Not",
+                                        0.5*log2FC_TR,
+                                        log2FC_TR),
+                     log2FC_SS = ifelse(SS_status == "Not",
+                                        0.5*log2FC_SS,
+                                        log2FC_SS)) %>%
+              select(-TR_na, -SS_na)
+
+# Reshape the data
+RATE_melt = reshape2::melt(RATE_clean,
+                           id.vars = c("gene", "TR_status", "SS_status")) %>%
+            mutate(variable = gsub("log2FC_", "", variable),
+                   variable = factor(variable,
+                                     levels=c("TR", "SS")))
+```
+
+Define heatmap groups
+```{r}
+heatmap_data = RATE_melt %>%
+    mutate(variable = gsub("log2FC_", "", variable),
+           variable = factor(variable,
+                             levels=c("TR", "SS"))) %>%
+    group_by(gene) %>%
+    mutate(SS_TR_status = ifelse(abs(value[variable == "SS"] - value[variable == "TR"])/abs(value[variable == "TR"]) > 0.25, 
+                                 "Yes", "Not"),
+           SS_TR_status = ifelse(SS_TR_status == "Not" & 
+                                   ((TR_status == "Up" & SS_status %in% c("Not", "Down")) | 
+                                      (TR_status == "Down" & SS_status %in% c("Not", "Up"))), 
+                                 "Yes", SS_TR_status),
+           SS_TR_status = ifelse(value[variable == "SS"] - value[variable == "TR"] > 0 & SS_TR_status == "Yes", 
+                                 "Yes_SS", SS_TR_status),
+           SS_TR_status = ifelse(value[variable == "TR"] - value[variable == "SS"] > 0 & SS_TR_status == "Yes", 
+                                 "Yes_TR", SS_TR_status)) %>%
+    ungroup() %>%
+    mutate(reg_group = ifelse(SS_TR_status == "Not", "Follow", NA),
+           reg_group = ifelse((TR_status == "Up" & SS_TR_status == "Yes_SS") | 
+                                (TR_status == "Down" & SS_TR_status == "Yes_TR") | 
+                                (TR_status == "Not" & (SS_TR_status %in% c("Yes_SS", "Yes_TR"))), 
+                              "Boost", reg_group),
+           reg_group = ifelse((TR_status == "Up" & SS_TR_status == "Yes_TR") | 
+                              (TR_status == "Down" & SS_TR_status == "Yes_SS"), 
+                              "Buffer", reg_group),
+           reg_group = ifelse(reg_group=="Boost" & 
+                              ((TR_status == "Down" & SS_status == "Not") |
+                               (TR_status == "Up" & SS_status == "Not")), 
+                              "Buffer", reg_group),
+           reg_group = ifelse(reg_group == "Boost" & TR_status == "Not", 
+                              "Boost_HL", reg_group),
+           SS_status = ifelse(reg_group == "Buffer" & TR_status == "Down" & SS_status == "Down", 
+                              "Not", SS_status),
+           SS_status = ifelse(reg_group == "Buffer" & TR_status == "Up" & SS_status == "Up", 
+                              "Not", SS_status),
+           SS_status = ifelse(reg_group=="Buffer" & TR_status == "Down" & SS_status == "Up", 
+                              "Not", SS_status),
+           SS_status = ifelse(reg_group=="Buffer" & TR_status == "Up" & SS_status == "Down", 
+                              "Not", SS_status),
+           reg_group = factor(reg_group,
+                              levels=c("Follow", "Boost", "Boost_HL", "Buffer"))) %>%
+    mutate(value = (e1071::sigmoid(0.5*value) - 0.5))
+```
+
+Sort genes
+```{r}
+genes = (heatmap_data %>%
+             filter(variable == "TR") %>%
+             mutate(TR_status = factor(TR_status,
+                                       levels = c("Down", "Not", "Up"))) %>%
+             arrange(reg_group, TR_status, SS_status, value) %>%
+             mutate(gene = factor(gene, levels=unique(gene))))$gene
+heatmap_df = heatmap_data %>%
+             mutate(gene = factor(gene, levels=genes),
+                    TR_status = factor(TR_status,
+                                       levels = c("Down", "Not", "Up")))
+```
+
+Visualize buffering heatmap
+```{r}
+borders = (heatmap_df %>%
+               filter(variable == "TR") %>%
+               group_by(reg_group, TR_status, SS_status) %>%
+               summarise(n=n()))$n
+  
+output = paste(root, "heatmap_buffering.pdf", sep = "")
+ggplot(data = heatmap_df,
+         aes(x = variable,
+             y = gene,
+             fill = value)) +
+    geom_tile() +
+    geom_hline(yintercept = cumsum(borders)) +
+    theme(axis.title.y=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank()) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scico::scale_fill_scico(palette = "cork",
+                            breaks = c(-0.4241418, -0.2772999, 0, 0.2772999, 0.4241418),
+                            labels = c(-5, -2.5, 0, 2.5, 5),
+                            name = latex2exp::TeX("$log_{2}$(FC)")) +
+    theme(plot.background = element_rect(fill = "white",
+                                         colour = "white",
+                                         size = 1))
+    ggsave(output, width = 1.5, height = 3)
+```
+
+
+Prepare data for the barplot of TR, SS and SS_TR fold-changes
+```{r}
+RATE_collector=list()
+for (transition in c("NPC_iPS", "Neu_NPC")) {
+  log2FC_var=paste("log2FC_", transition, sep = "")
+  lfcSE_var=paste("lfcSE_", transition, sep = "")
+  padj_var=paste("padj_", transition, sep = "")
+  
+  for (assay in c("TR", "SS")) {
+    log2FC_out = paste("log2FC_", assay, sep = "")
+    lfcSE_out = paste("lfcSE_", assay, sep = "")
+    padj_out = paste("padj_", assay, sep = "")
+    
+    input_path = paste(root, assay, "_log2FC_deseq2.csv.gz", sep = "")
+    output_tbl = read.csv(input_path, header = T) %>%
+                 mutate(!!log2FC_out := .[,log2FC_var],
+                        !!lfcSE_out := .[,lfcSE_var],
+                        !!padj_out := .[,padj_var],
+                        transition) %>%
+                 select(gene, log2FC_out, lfcSE_out, padj_out, transition)
+    RATE_collector[[paste(assay, transition, sep = "_")]] = output_tbl
+  }
+  
+  input_path = paste(root, "SS_TR_deseq2.csv.gz", sep = "")
+  cells = strsplit(transition, "_")[[1]]
+  log2FC_varB = paste("log2_SS_TR_", cells[1], "_WT", sep="")
+  log2FC_varA = paste("log2_SS_TR_", cells[2], "_WT", sep="")
+  lfcSE_varB = paste("log2_SS_TR_", cells[1], "_WT", sep="")
+  lfcSE_varA = paste("log2_SS_TR_", cells[2], "_WT", sep="") 
+  RATE_SS_TR = read.csv(input_path, header = T) %>%
+               mutate(log2FC_SS_TR = .[,log2FC_varB] - .[,log2FC_varA],
+                      lfcSE_SS_TR = sqrt(.[,lfcSE_varB]**2 + .[,lfcSE_varA]**2)/sqrt(4),
+                      Z_SS_TR = abs(log2FC_SS_TR)/sqrt(lfcSE_SS_TR),
+                      transition) %>%
+               select(gene, log2FC_SS_TR, lfcSE_SS_TR, Z_SS_TR)
+  RATE_collector[[paste("SS_TR", transition, sep = "_")]] = RATE_SS_TR
+}
+
+transition_step = "NPC_iPS"
+RATE_FULL = full_join(RATE_collector[[paste("SS_", transition_step, sep="")]], 
+                      RATE_collector[[paste("TR_", transition_step, sep="")]], 
+                      by = c("gene", "transition")) %>%
+            left_join(RATE_collector[[paste("SS_TR_", transition_step, sep="")]])
+```
+
+Select genes
+```{r}
+if (transition_step == "NPC_iPS") {
+  genes = c("MYT1", "MSI2", "NDUFAF7",
+          "SETD2", "FEZ2", "EIF4E3",
+          "NRXN2", "HNRNPF", "VEGFA",
+          "SYP", "CTNND2", "DDX25")
+} else {
+  genes = c("ELAVL4", "SMAD3", "SYN1",
+          "DSN1", "EXOSC9", "DLG4",
+          "PEX11G", "FBXL2", "TDRD3", 
+          "ZSWIM5", "FOXP1", "DKK3")
+}
+```
+
+Format data for barplot
+```{r}
+df_A = reshape2::melt(RATE_FULL %>%
+                        filter(gene %in% genes) %>%
+                        select(gene, contains("log2FC")) %>%
+                        select(-contains("vs"))) %>%
+       mutate(assay = gsub("log2FC_", "", variable),
+              variable = gsub("_SS|_TR", "", variable),
+              MEAN = value) %>%
+       select(gene, assay, MEAN)
+df_B = reshape2::melt(RATE_FULL %>%
+                        filter(gene %in% genes) %>%
+                        select(gene, contains("lfc")) %>%
+                        select(-contains("vs"))) %>%
+       mutate(assay = gsub("lfcSE_", "", variable),
+              variable = gsub("_SS|_TR", "", variable),
+              SE = value) %>%
+       select(gene, assay, SE)
+
+reg_tbl = data.frame(gene = genes,
+                     reg_type = factor(c(rep("Transcriptin only", 3), 
+                                         rep("RNA stability only", 3),
+                                         rep("Buffering", 3), 
+                                         rep("Boosting", 3)),
+                                       levels=c("Transcriptin only", 
+                                                "RNA stability only", 
+                                                "Buffering", "Boosting")))
+df = full_join(df_A, df_B) %>%
+     left_join(reg_tbl) %>%
+     #filter(assay != "HL") %>%
+     #bind_rows(df_C) %>%
+     mutate(assay = factor(assay, levels = c("TR", "SS", "SS_TR")),
+            gene = factor(gene, levels=genes))
+```
+
+Show barplot
+```{r}
+output = paste(root, "barplot_buffering.pdf", sep = "")
+position = position_dodge()
+ggplot(data = df,
+       aes(x = gene,
+           y = MEAN,
+           fill = assay)) +
+  geom_bar(stat="identity", position=position, width = 0.7) +
+  geom_errorbar(aes(ymin = MEAN - SE,
+                    ymax = MEAN + SE), width = 0.2, 
+                position = position_dodge(width=0.7)) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = 5, alpha = 0.8) +
+  ggthemes::theme_base(base_size = 10) +
+  scale_fill_manual(values=c("#23C897", "#8761B0", "#FFA568")) +
+  facet_wrap(~reg_type, nrow = 1, scales = "free_x") +
+  coord_cartesian(ylim = c(-3.4, 3.4)) +
+  ylab(latex2exp::TeX("$log_{2}$ fold-change")) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        strip.text.x = element_text(angle = 0))  
+  ggsave(output,
+         width = 7, height = 2.48)
+```
+
+
+

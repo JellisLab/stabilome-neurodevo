@@ -1,0 +1,145 @@
+---
+title: "Process mouse data"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(IRanges)
+library(ggplot2)
+```
+
+Set the path to data directory
+```{r}
+root = "./data/"
+```
+
+Upload data from Ago2 mouse study
+```{r}
+xls_file <- R.utils::gunzip(paste(root, "Ago2_peaks_mESC_PMID32497496.xlsx.gz", sep = ""))
+mESC_Ago2 = readxl::read_xlsx(xls_file, sheet = 1)
+
+# Subset of columns from QAPA annotating 3UTR isoforms
+mESC_QAPA_annot = read.csv(paste(root, "dicerKO_mESC_PAU_results.txt.gz", sep = ""), header = T)
+mESC_3UTR_DEA = read.csv(paste(root, "dicerKO_mESC_SS_3UTR_DESeq2.txt.gz", sep = ""), header = T) %>%
+                tidyr::separate(gene, c("gene", "ensembl_id", "num", "APA_ID"), "_") %>%
+                # Keep tandem 3UTR isoforms with detected counts
+                filter(!grepl("S", APA_ID),
+                       baseMean > 0)
+mESC_gene_DEA = read.csv(paste(root, "dicerKO_mESC_SS_gene_DESeq2.txt.gz", sep = ""), header = T) %>%
+                select(gene, log2FoldChange, padj)
+```
+
+Define auxiliary functions.
+A major problem with the approach. We can't tell whether Ago2 peak is from short or long 3`UTR. Also, is QAPA sensitive enough? Likely, but ...
+```{r}
+match_QAPA_Ago2_peaks <- function(QAPA_data, Ago2_data) {
+  # Convert QAPA 3UTR annotation to GRanges
+  QAPA_gr = GenomicRanges::makeGRangesFromDataFrame(QAPA_data, keep.extra.columns = T)
+  
+  # Format Ago2 peaks data and convert to GRanges
+  Ago2_coords = Ago2_data %>%
+                filter(annot == "utr3") %>%
+                #filter(input.log2FC > 1 & input.padj < 0.05) %>%
+                select(seqnames, start, end, strand, name, count, score, input.log2FC, input.padj)
+  Ago2_gr = GenomicRanges::makeGRangesFromDataFrame(Ago2_coords, keep.extra.columns = T)
+  
+  # Overlap Ago2 peaks and 3UTR annotations
+  found_peaks_tbl = data.frame(findOverlaps(QAPA_gr, Ago2_gr))
+  
+  # Format overlap table
+  QAPA_Ago2 = data.frame(cbind(data.frame(QAPA_gr[found_peaks_tbl$queryHits, ]) %>% 
+                                 select(APA_ID, Length),
+                               data.frame(Ago2_gr[found_peaks_tbl$subjectHits, ]) %>% 
+                                 select(name, count, score, input.log2FC, input.padj))) %>%
+              tidyr::separate(APA_ID, c("gene", "APA_ID"), "_E") %>%
+              filter(grepl("_P|_D", APA_ID)) %>%
+              group_by(gene) %>%
+              mutate(APA_ID = ifelse(Length == min(Length), "P", NA),
+                     APA_ID = ifelse(Length == max(Length), "D", APA_ID)) %>%
+              filter(!is.na(APA_ID))
+  
+  return(QAPA_Ago2)
+}
+```
+
+Match Ago2 peaks to 3UTR annotation
+```{r}
+QAPA_Ago2 = match_QAPA_Ago2_peaks(QAPA_data = mESC_QAPA_annot, Ago2_data = mESC_Ago2)
+```
+
+Show log2FoldChange for Ago2 targets
+```{r}
+QAPA_Ago2_summary = QAPA_Ago2 %>%
+                    group_by(gene) %>%
+                    mutate(input.log2FC = ifelse(input.padj > 0.1, 0, input.log2FC)) %>%
+                    summarise(signal_sum = sum(input.log2FC)) %>%
+                    mutate(log_signal = log(signal_sum, 2),
+                           log_signal = log_signal %/% 2 * 2) %>%
+                    select(gene, log_signal)
+
+gene_summary = QAPA_Ago2_summary %>%
+               left_join(mESC_gene_DEA) %>%
+               na.omit()
+
+ggplot(data = gene_summary,
+       aes(x = log_signal,
+           y = log2FoldChange,
+           group = log_signal)) +
+  geom_boxplot(notch = T, outlier.size = 0.1,
+               fill = "#5D3FD3", alpha = 0.5) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  coord_cartesian(ylim = c(-2, 2)) +
+  xlab(latex2exp::TeX("Ago2, $log_{2}$(counts)")) +
+  ylab(latex2exp::TeX("steady-state, $log_{2}$(FC)")) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1)) 
+```
+
+Show differential response between short and long 3UTR isoforms
+```{r}
+UTR_summary = mESC_3UTR_DEA %>%
+              group_by(gene) %>%
+              # Pick 2 most abundand 3UTR isoforms
+              top_n(n = 2, wt = baseMean) %>%
+              filter(n() == 2) %>%
+              summarise(logFC_SS = log2FoldChange[APA_ID=="D"] - log2FoldChange[APA_ID=="P"],
+                        logFC_SS_SE = sqrt(lfcSE[APA_ID=="D"]**2 + lfcSE[APA_ID=="P"]**2),
+                        logFC_SS_Z = abs(logFC_SS)/logFC_SS_SE)
+
+Ago2_summary = QAPA_Ago2 %>%
+               group_by(gene) %>%
+               mutate(input.log2FC = ifelse(input.padj > 0.1, 0, input.log2FC)) %>%
+               summarise(log_ES_P = max(input.log2FC[APA_ID == "P"]),
+                         log_ES_D = max(input.log2FC[APA_ID == "D"])) 
+
+Ago2_UTR_summary = Ago2_summary %>%
+                   left_join(UTR_summary) %>%
+                   # Subset genes with stronger Ago2 signal in long 3UTR
+                   filter(log_ES_P < log_ES_D) %>%
+                   # Subset genes with a detected difference between short and long 3UTR
+                   filter(logFC_SS_Z > 0.5)
+
+ggplot(data = Ago2_UTR_summary,
+       aes(x = logFC_SS)) +
+  geom_histogram(bins = 200, fill="#5D3FD3", alpha = 0.8) +
+  coord_cartesian(xlim = c(-3, 3)) +
+  xlab(latex2exp::TeX("steady-state fold-change, $\\frac{long}{short}$, $log_{2}$")) +
+  ylab("genes") +
+  ggthemes::theme_base() +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+```
+
+
+
+
+
+

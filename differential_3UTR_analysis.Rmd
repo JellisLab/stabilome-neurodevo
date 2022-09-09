@@ -1,0 +1,344 @@
+---
+title: "Differential mRNA stability of 3UTR isoforms"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Set the path to data directory
+```{r}
+root = "./data/"
+```
+
+Counts and HL tables
+```{r}
+load_counts <- function(path, assay) {
+  if (assay == "SS_TR") {
+    tbl = read.csv(path, header = T) %>%
+          tidyr::separate(gene, c("gene", "strand", "start"), "_") %>%
+          mutate(ID = paste(gene, start, sep = "_"),
+                 region_start = as.numeric(start)) %>%
+          select(gene, ID, strand, region_start, contains(assay))
+  } else {
+    tbl = read.csv(path, header = T) %>%
+          filter(!grepl("alt|random|Un", gene)) %>%
+          tidyr::separate(gene, c("X", "site_type"), ";") %>%
+          tidyr::separate(X, c("gene", "chr", "strand", "start", "end"), "_") %>%
+          filter(grepl("3UTR|CDS|5UTR", site_type)) %>%
+          mutate(ID = paste(gene, start, sep = "_"),
+                 region_start = as.numeric(start)) %>%
+          select(-contains("SD")) %>%
+          select(gene, ID, strand, region_start, contains(assay))
+  }
+  
+  return(tbl)
+}
+
+SS_path = paste(root, "SS_isoforms.csv.gz", sep = "")
+TR_path = paste(root, "TR_isoforms.csv.gz", sep = "")
+SS_TR_path = paste(root, "SS_TR_isoforms.csv.gz", sep = "")
+TR_gene_path = paste(root, "TR_log2FC_deseq2.csv.gz", sep = "")
+SS_TR_gene_path = paste(root, "SS_TR_deseq2.csv.gz", sep = "")
+EXON_ANNOT_path = paste(root, "Tian_pA_map.bed.gz", sep = "")
+
+EXON_ANNOT_tbl = read.table(EXON_ANNOT_path, header = F) %>%
+                 mutate(ID = paste(V4, V2, sep = "_"),
+                        exon_type = V7) %>%
+                 select(ID, exon_type)
+
+SS_tbl = load_counts(SS_path, "SS") %>%
+         left_join(EXON_ANNOT_tbl)
+TR_tbl = load_counts(TR_path, "TR") %>%
+         left_join(EXON_ANNOT_tbl)
+SS_TR_tbl = load_counts(SS_TR_path, "SS_TR") %>%
+            left_join(EXON_ANNOT_tbl)
+
+TR_gene_tbl = read.csv(TR_gene_path, header = T) %>%
+              select(gene, contains("log2"), contains("padj"))
+colnames(TR_gene_tbl) = gsub("log2FC", "log2FC_TRgene", colnames(TR_gene_tbl))
+colnames(TR_gene_tbl) = gsub("padj", "padj_TRgene", colnames(TR_gene_tbl))
+
+SS_TR_gene_tbl = read.csv(SS_TR_gene_path, header = T) %>%
+                 select(gene, contains("log2"), contains("padj"))
+colnames(SS_TR_gene_tbl) = gsub("log2_SS_TR", "log2_SS_TR_gene", 
+                                colnames(SS_TR_gene_tbl))
+colnames(SS_TR_gene_tbl) = gsub("padj", "padj_SS_TR_gene", 
+                                colnames(SS_TR_gene_tbl))
+```
+
+
+Auxiliary functions
+```{r}
+long_classified_tbl <- function(tbl, assay) {
+  melt_tbl = reshape2::melt(tbl %>% 
+                            select(gene, strand, region_start, exon_type, contains(assay)) %>%
+                            dplyr::rename(start = region_start),
+                          id.vars = c("gene", "exon_type", "strand", "start")) %>%
+            dplyr::rename(celltype = variable) %>%
+            mutate(celltype = gsub("SS_|TR_", "", celltype)) %>%
+            group_by(gene, celltype) %>%
+            mutate(UTR = ifelse(strand == "+" & start == min(start), "prox", NA),
+                   UTR = ifelse(strand == "-" & start == max(start), "prox", UTR),
+                   UTR = ifelse(strand == "+" & start != min(start), "dist", UTR),
+                   UTR = ifelse(strand == "-" & start != max(start), "dist", UTR)) %>%
+            filter(length(unique(UTR)) > 1)
+  
+  return(melt_tbl)
+}
+
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+```
+
+
+Isolate genes with a chance to have differential RNA stability. TR of a gene is high.
+Ratio of proximal and distal TR is finite and non-zero
+```{r}
+get_density <- function(x, y, n = 100) {
+  dens <- MASS::kde2d(x = x, y = y, n = n)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+SS_genes = long_classified_tbl(SS_tbl, "SS_") %>%
+           dplyr::rename(SS = value) %>%
+           group_by(celltype, gene) %>%
+           mutate(SS_gene = sum(SS, na.rm = T),
+                  SS_dist_gm = gm_mean(SS[UTR == "dist"]),
+                  SS_dist_sum = sum(SS[UTR == "dist"], na.rm = T),
+                  SS_dist_mean = mean(SS[UTR == "dist"], na.rm = T),
+                  SS_prox = SS[UTR == "prox"]) %>%
+           ungroup()
+TR_genes = long_classified_tbl(TR_tbl, "TR_") %>%
+           dplyr::rename(TR = value) %>%
+           group_by(celltype, gene) %>%
+           mutate(TR_gene = sum(TR, na.rm = T),
+                  distance = abs(max(start) - min(start)),
+                  TR_dist_gm = gm_mean(TR[UTR == "dist"]),
+                  TR_dist_sum = sum(TR[UTR == "dist"], na.rm = T),
+                  TR_dist_mean = mean(TR[UTR == "dist"], na.rm = T),
+                  TR_prox = TR[UTR == "prox"],
+                  TR_gene = ifelse(TR_gene == 0, 0.01, TR_gene))
+SS_TR_genes = long_classified_tbl(left_join(TR_tbl %>% 
+                                              select(gene, region_start),
+                                            SS_TR_tbl), 
+                                  "SS_TR_") %>%
+              dplyr::rename(log2_SS_TR = value) %>%
+              mutate(celltype = gsub("log2_", "", celltype))
+```
+
+
+
+
+```{r}
+APA_base = TR_genes %>% 
+           left_join(SS_genes) %>%
+           left_join(SS_TR_genes) %>%
+           filter(exon_type == "Last_exon",
+                  TR != 0) %>%
+           mutate(ID = paste(gene, start, sep = "_")) %>%
+           select(gene, strand, start, ID, UTR, TR, SS, TR_gene, SS_gene)
+
+# Select top 2 by abundance 3UTR isoforms in stem cells
+ID_iPSC = (APA_base %>%
+             filter(celltype == "iPS") %>%
+             top_n(2, TR) %>%
+             group_by(gene) %>%
+             mutate(N = n()) %>%
+             filter(N > 1) %>%
+             mutate(UTR = ifelse(strand == "+" & start == min(start), "prox", NA),
+                    UTR = ifelse(strand == "-" & start == max(start), "prox", UTR),
+                    UTR = ifelse(strand == "+" & start != min(start), "dist", UTR),
+                    UTR = ifelse(strand == "-" & start != max(start), "dist", UTR),
+                    distance = abs(dplyr::first(start[UTR=="dist"])-start[UTR=="prox"])) %>%
+             group_by(gene, celltype, UTR) %>%
+             filter(1:n() == 1))$ID
+
+# Each gene ends up exactly with 2 isoforms
+table((APA_base %>%
+         filter(celltype == "iPS") %>%
+         filter(ID %in% ID_iPSC) %>%
+         group_by(gene) %>%
+         summarise(n=n()))$n)
+
+# Select genes that contains those 2 isoforms during neurodevelopment
+gene_common = unique((APA_base  %>%
+                        filter(ID %in% ID_iPSC) %>%
+                        group_by(gene) %>%
+                        filter(n() == 6))$gene)
+gene_iPSC = unique((APA_base  %>%
+                      filter(ID %in% ID_iPSC))$gene)
+
+APA_iPSC_genes_clean = APA_base %>%
+                       filter(ID %in% ID_iPSC, 
+                              gene %in% gene_common) %>%
+                       group_by(gene, celltype) %>%
+                       mutate(UTR = ifelse(strand == "+" & start == min(start), "prox", NA),
+                              UTR = ifelse(strand == "-" & start == max(start), "prox", UTR),
+                              UTR = ifelse(strand == "+" & start != min(start), "dist", UTR),
+                              UTR = ifelse(strand == "-" & start != max(start), "dist", UTR),
+                              distance = abs(dplyr::first(start[UTR=="dist"])-start[UTR=="prox"]),
+                              SS = ifelse(SS == 0, 0.1*TR, SS),
+                              log2FC_SS_TR = log(SS/TR, 2)) %>%
+                       filter(distance > 30 & distance < 2e4)
+
+APA_iPSC_genes_boxplot = APA_iPSC_genes_clean  %>%
+                         group_by(gene, celltype) %>%
+                         mutate(log2_SS_TR_dist = log2FC_SS_TR[UTR=="dist"],
+                                log2_SS_TR_prox = log2FC_SS_TR[UTR=="prox"]) %>%
+                         summarise(distance = dplyr::first(distance),
+                                   log2FC_SS_TR_PAU = dplyr::first(log2_SS_TR_dist-log2_SS_TR_prox))
+
+APA_iPSC_genes_shift = APA_iPSC_genes_clean %>%
+                       left_join(data.frame(celltype=c("iPS", "NPC", "Neu"),
+                                            factor=c(5.5, 5.5, 3.0))) %>%
+                       group_by(celltype) %>% 
+                       mutate(log2FC_SS_TR = log2FC_SS_TR/mean(log2FC_SS_TR)*factor) %>%
+                       group_by(gene, UTR) %>%
+                       summarise(distance = dplyr::first(distance),
+                                 log2FC_SS_TR_A = log2FC_SS_TR[celltype == "NPC"] - log2FC_SS_TR[celltype == "iPS"],
+                                 log2FC_SS_TR_B = log2FC_SS_TR[celltype == "Neu"] - log2FC_SS_TR[celltype == "NPC"],
+                                 log2FC_SS_TR_C = log2FC_SS_TR[celltype == "Neu"] - log2FC_SS_TR[celltype == "iPS"])
+
+
+output = paste(root, "neurodev_boxplot_APA.pdf", sep = "")
+APA_iPSC_genes_boxplot %>%
+  filter(distance < 1e4) %>%
+  mutate(distance = log(distance, 10) %/% 0.35 * 0.35,
+         celltype = factor(celltype, levels=c("iPS", "NPC", "Neu"))) %>%
+  select(gene, distance, celltype, log2FC_SS_TR_PAU) %>%
+  distinct() %>%
+  ggplot(aes(x = distance,
+             y = log2FC_SS_TR_PAU,
+             fill = celltype,
+             group = distance)) +
+  geom_boxplot(notch = T, outlier.size = 0.1) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~celltype, nrow = 1) +
+  scale_fill_manual(values = c("#00FF95", "#FF0000", "#0092FF", "#FFAA00")) +
+  coord_cartesian(ylim = c(-5.5, 2.5)) +
+  scale_x_continuous(breaks = c(2, 3, 4),
+                     labels = c(0.1, 1, 10)) +
+  ggthemes::theme_base(base_size = 20) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1)) +
+  xlab(latex2exp::TeX("distance, (kb)")) +
+  ylab(latex2exp::TeX("half-life, $log_{2} \\frac{dist}{prox}$")) 
+  ggsave(output, useDingbats = F,
+         width = 8, height = 3)
+
+output = paste(root, "long_vs_short_HL_FC.pdf", sep = "")
+reshape2::melt(APA_iPSC_genes_shift, id.vars=c("gene", "UTR", "distance")) %>%
+  mutate(distance = distance > 500,
+         distance = ifelse(distance == T, ">500nt", "<500nt"),
+         variable = gsub("log2FC_SS_TR_", "", variable)) %>%
+  ggplot(aes(x = variable,
+             y = value,
+             fill = UTR)) +
+  geom_boxplot(notch = T, outlier.size = 0.1) +
+  facet_wrap(~distance, scales="free") +
+  coord_cartesian(ylim = c(-8, 2.5)) +
+  ggthemes::theme_base() +
+  scale_fill_brewer(palette = "Purples") +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1)) 
+  ggsave(output,
+         width = 4.5, height = 3)
+
+
+APA_iPSC_SS_vs_TR = APA_iPSC_genes_clean %>%
+                    group_by(gene, celltype) %>%
+                    mutate(log2_SS_dist_prox = log(SS[UTR=="dist"], 2) - log(SS[UTR=="prox"], 2),
+                           log2_TR_dist_prox = log(TR[UTR=="dist"], 2) - log(TR[UTR=="prox"], 2)) %>%
+                    select(gene, TR_gene, celltype, distance, log2_SS_dist_prox, log2_TR_dist_prox)
+output = paste(root, "SS_vs_TR_iPSC_boxplot.pdf", sep = "")
+ggplot(data = reshape2::melt(APA_iPSC_SS_vs_TR,
+                             id.vars=c("gene", "celltype", "distance", "TR_gene")) %>%
+              filter(celltype == "iPS",
+                     distance > 500) %>%
+              mutate(variable = ifelse(grepl("TR", variable), "TR", variable),
+                     variable = ifelse(grepl("1", variable), "SS", variable)),
+       aes(x = variable,
+           y = value)) +
+  geom_boxplot(notch = T, fill = "#00FF95", alpha = 0.75) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~celltype) +
+  ggthemes::theme_base() +
+  coord_cartesian(ylim = c(-5, 5)) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+  ggsave(output, width = 2, height = 3)
+
+output = paste(root, "SS_neurodev.pdf", sep = "")
+ggplot(data = reshape2::melt(APA_iPSC_SS_vs_TR,
+                             id.vars=c("gene", "celltype", "distance", "TR_gene")) %>%
+              mutate(variable = ifelse(grepl("TR", variable), "TR", variable),
+                     variable = ifelse(grepl("1", variable), "SS", variable)) %>%
+              filter(distance > 500, variable == "SS") %>%
+              unique() %>%
+              mutate(celltype = factor(celltype,
+                                       levels = c("iPS", "NPC", "Neu"))),
+       aes(x = celltype,
+           y = value,
+           fill = celltype)) +
+  geom_boxplot(notch = T, alpha = 0.75) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#00FF95", "#FF0000", "#0092FF")) +
+  coord_cartesian(ylim = c(-5, 5)) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1)) 
+  ggsave(output, width = 3, height = 3)
+
+output = paste(root, "genes_UTR_length.pdf", sep = "")
+ggplot(data = APA_iPSC_genes_clean %>%
+              filter(celltype == "iPS") %>%
+              distinct(gene, distance),
+       aes(x = log(distance, 10))) +
+  stat_bin(fill = "#5D3FD3", bins = 100, alpha = 0.8) +
+  geom_density(aes(y = ..count../35),
+               geom="line")  +
+  ggthemes::theme_base() +
+  scale_x_continuous(breaks = c(2, 3, 4)) +
+  ylab("genes") +
+  coord_cartesian(ylim = c(0, 180)) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+  ggsave(output, 
+         width = 3.5, height = 3)
+
+
+APA_TR_summary = APA_base %>%
+                 group_by(gene, celltype) %>%
+                 arrange(desc(TR)) %>%
+                 mutate(idx = 1:n()) %>%
+                 summarise(n = n(),
+                           TR_top_1 = TR[idx==1],
+                           TR_top_2 = TR[idx==1] + TR[idx==2],
+                           log2_TR_ratio = log(TR[idx==1]/TR[idx==2], 2),
+                           TR_gene) %>%
+                 unique() %>%
+                 mutate(TR_frac_1 = TR_top_1/TR_gene,
+                        TR_frac_2 = TR_top_2/TR_gene)
+
+output = paste(root, "top_TR_isoforms.pdf", sep = "")
+ggplot(data = reshape2::melt(APA_TR_summary %>%
+                               filter(celltype == "iPS") %>%
+                               select(contains("TR_frac"))),
+       aes(x = variable,
+           y = value,
+           fill = variable)) +
+  geom_boxplot(notch = T, outlier.size = 0.1) +
+  ggthemes::theme_base() +
+  scale_fill_brewer(palette= "Purples", direction=1) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1)) 
+  ggsave(output, width = 3.25, height = 3)
+```

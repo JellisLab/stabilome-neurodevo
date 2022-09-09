@@ -1,0 +1,243 @@
+---
+title: "Shifts in counts data after transitions"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Set the path to data directory
+```{r}
+root = "./data/"
+```
+
+Upload counts fold-change data
+```{r}
+TR_tbl =  read.csv(paste(root, "TR_log2FC_deseq2.csv.gz", sep = ""), header = T)
+SS_tbl =  read.csv(paste(root, "SS_log2FC_deseq2.csv.gz", sep = ""), header = T)
+qPCR = read.csv(paste(root, "qRT_PCR_fractions_data.csv", sep = "")) %>%
+       mutate(sc_TAF10 = as.numeric(sc_TAF10),
+              gene = gsub("\\(TR\\)|\\(HL\\)| ", "", gene),
+              transition = gsub("NEU", "Neu", transition))
+```
+
+Auxiliary functions
+```{r}
+# Function due to Kamil Slowikowski
+# https://slowkow.com/notes/ggplot2-color-by-density/
+get_density <- function(x, y, n = 100) {
+  dens <- MASS::kde2d(x = x, y = y, n = n)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+prepare_counts <- function(tbl, assay, celltypeA, celltypeB) {
+  output_tbl = tbl %>%
+                select_(.dots = c("gene",
+                                  paste("padj", celltypeB, celltypeA, sep = "_"),
+                                  paste(assay, celltypeA, sep = "_"), 
+                                  paste(assay, celltypeB, sep = "_"),
+                                  paste(assay, celltypeA, "SD", sep = "_"), 
+                                  paste(assay, celltypeB, "SD", sep = "_"),
+                                  paste("log2FC", celltypeB, celltypeA, sep = "_"))) %>%
+                rename_(.dots = setNames(paste("padj", celltypeB, celltypeA, sep = "_"), 
+                                         "padj")) %>%
+                rename_(.dots = setNames(paste(assay, celltypeA, sep = "_"), 
+                                         "A")) %>%
+                rename_(.dots = setNames(paste(assay, celltypeB, sep = "_"), 
+                                         "B")) %>%
+                rename_(.dots = setNames(paste(assay, celltypeA, "SD", sep = "_"), 
+                                         "A_SD")) %>%
+                rename_(.dots = setNames(paste(assay, celltypeB, "SD", sep = "_"), 
+                                         "B_SD")) %>%
+                rename_(.dots = setNames(paste("log2FC", celltypeB, celltypeA, sep = "_"), 
+                                         "log2FC_B_A")) %>%
+                unique() %>%
+                na.omit() %>%
+                mutate(A = ifelse(A == 0, 0.01, A),
+                       B = ifelse(B == 0, 0.01, B)) %>%
+                mutate(density = get_density(log(A), log(B), 150),
+                       logFC = log(B/A)) %>%
+                mutate(padj_score = -log(padj, 10))
+  
+  return(output_tbl)
+}
+```
+
+Show scatterplots for fold-changes in TR and SS
+```{r}
+data_list = list()
+data_list[["SS"]] = SS_tbl
+data_list[["TR"]] = TR_tbl
+
+assay = "TR"
+celltypesA = c("iPS", "NPC", "iPS")
+celltypesB = c("NPC", "Neu", "Neu")
+for (ind in c(1:3)) {
+  # Compared cell types
+  celltypeA = celltypesA[ind]
+  celltypeB = celltypesB[ind]
+
+  if (celltypeB == "NPC") {
+    panel_genes = c("PAX6", "NES", "SOX1", "VIM", "NANOG", "LIN28A", "KLF4", "GAPDH")
+    panel_color = c(rep("#FF0000", 4), rep("#00FF95", 3), "black")
+    panel_tbl = data.frame(gene = panel_genes, 
+                           panel_color)
+  }
+  if (celltypeB == "Neu") {
+    panel_genes = c("FABP7", "HOPX", "ID2", "DCX", "BCL11B", "FEZF1", "FOXG1", "GAPDH")
+    panel_color = c(rep("#FF0000", 3), rep("#0092FF", 4), "black")
+    panel_tbl = data.frame(gene = panel_genes, 
+                           panel_color)
+  }
+  
+  graph_full_tbl = prepare_counts(data_list[[assay]], assay, celltypeA, celltypeB) %>%
+                    mutate(padj_score = -log(padj, 10),
+                           padj_score = ifelse(padj_score > 30, 30, padj_score)) %>%
+                    arrange(padj_score) %>%
+                    mutate(log2_A = log(A, 2),
+                           log2_B = log(B, 2))
+  
+  if (assay == "SS") {
+    graph_full_tbl = graph_full_tbl %>%
+                     mutate(log2_A = ifelse(A==0.01, log(0.2, 2), log2_A),
+                            log2_B = ifelse(B==0.01, log(0.2, 2), log2_B),
+                            log2_A = log2_A - 5,
+                            log2_B = log2_B - 5)
+  }
+  
+  graph_tbl = graph_full_tbl %>%
+                mutate(A_idx = log(A, 2) %/% 0.25,
+                       B_idx = log(B, 2) %/% 0.25) %>%
+                group_by(A_idx, B_idx) %>%
+                mutate(ID = 1:n()) %>%
+                filter(ID == 1 | gene %in% panel_genes)
+  
+  output = paste(root, assay, "_", celltypeB, "_vs_", celltypeA, ".pdf", sep = "")
+  ggplot(data = graph_tbl,
+         aes(x = log2_A,
+             y = log2_B,
+             colour = padj_score)) +
+    geom_point(size = 1.5) +
+    geom_density2d(data = graph_full_tbl,
+                   linetype = 1, color = "white",
+                   bins = 10) +
+    geom_point(data = left_join(panel_tbl, graph_full_tbl),
+               pch = 21, color = "black",
+               fill = panel_tbl$panel_color, size = 2) +
+    ggrepel::geom_text_repel(data = left_join(panel_tbl, graph_full_tbl),
+                             aes(label = gene), 
+                             bg.color = "white", bg.r = 0.025, 
+                             color = panel_tbl$panel_color, size = 4) +
+    ggthemes::theme_base() +
+    scale_color_gradient(low = "grey", high = "#5D3FD3", na.value = "black") +
+    coord_cartesian(xlim = c(-7, 15.5),
+                    ylim = c(-7, 15.5)) +
+    xlab(latex2exp::TeX(paste(celltypeA, assay, "counts, ($log_{2}$)", sep = " "))) +
+    ylab(latex2exp::TeX(paste(celltypeB, assay, "counts, ($log_{2}$)", sep = " "))) +
+    theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+    # Save the plot
+    ggsave(output, 
+           width = 5, height = 3.5,
+           useDingbats = F)
+}
+  
+```
+
+Compare RATE-seq and qRT_PCR validations
+```{r}
+qPCR_stats = qPCR %>%
+             mutate(geom_avg = exp(rowMeans(log(qPCR[,2:3]), na.rm = T))) %>%
+             group_by(gene, transition) %>%
+             summarise(log2FC_qPCR = mean(log(geom_avg, 2)),
+                       log2FC_qPCR_se = sd(log(geom_avg, 2))/sqrt(n())) 
+
+npc_ips_genes = c("ARL2", "BTG3", "HEYL", "LHFPL2", "VASH2")
+neu_npc_genes = c("DUSP26", "NNAT", "PLPP3", "SVIP")
+RATE_stats = TR_tbl %>%
+       mutate(log2FC_RATE = ifelse(gene %in% npc_ips_genes,
+                                   log2FC_NPC_iPS, NA),
+              log2FC_RATE_se = ifelse(gene %in% npc_ips_genes,
+                                      lfcSE_NPC_iPS, NA),
+              transition = ifelse(gene %in% npc_ips_genes,
+                                  "NPC/iPSC", NA),
+              log2FC_RATE = ifelse(gene %in% neu_npc_genes,
+                                   log2FC_Neu_NPC, log2FC_RATE),
+              log2FC_RATE_se = ifelse(gene %in% neu_npc_genes,
+                                      lfcSE_Neu_NPC, log2FC_RATE_se),
+              transition = ifelse(gene %in% neu_npc_genes,
+                                  "Neu/NPC", transition)) %>%
+       na.omit() %>%
+       select(gene, transition, log2FC_RATE, log2FC_RATE_se) 
+       
+
+RATE_qPCR = full_join(RATE_stats, qPCR_stats) %>%
+            mutate(transition = factor(transition,
+                                       levels = c("NPC/iPSC", "Neu/NPC")))
+
+output = paste(root, "RATE_qPCR.pdf", sep = "")
+ggplot(data = RATE_qPCR,
+       aes(x = log2FC_RATE,
+           y = log2FC_qPCR)) +
+  geom_abline() +
+  geom_smooth(method = "lm", color = "red", se = F, size = 0.75) +
+  geom_errorbar(aes(ymin = log2FC_qPCR - log2FC_qPCR_se,
+                    ymax = log2FC_qPCR + log2FC_qPCR_se),
+                width = 0.15) +
+  geom_errorbarh(aes(xmin = log2FC_RATE - log2FC_RATE_se,
+                     xmax = log2FC_RATE + log2FC_RATE_se)) +
+  ggrepel::geom_text_repel(aes(label = gene)) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  geom_point(aes(fill = transition),
+             size = 3.5, pch = 21, color = "black") +
+  ggthemes::theme_base(base_size = 20) +
+  coord_cartesian(xlim = c(-5, 6),
+                  ylim = c(-5, 6)) +
+  xlab(latex2exp::TeX("RATE-seq $log_{2}(FC_{TR})$")) +
+  ylab(latex2exp::TeX("qRT-PCR $log_{2}(FC_{NUC})$")) +
+  scale_fill_manual(values=c("#5D3FD3", "#CCCCFF")) +
+  theme(plot.background = element_rect(fill = "white", colour = "white", size = 1))
+  ggsave(output, useDingbats = F,
+         width = 6, height = 4)
+```
+
+Visualize venn diagram
+```{r}
+transition = "NPC_iPS"
+TR_genes = (TR_tbl %>%
+              select(gene, 
+                     contains(paste("padj_", transition, sep = "")),
+                     contains(paste("log2FC_", transition, sep = ""))) %>%
+              filter_(paste("padj_", transition, " < 0.1", sep = "")) %>%
+              filter_(paste("abs(log2FC_", transition, ") > 1", sep = "")))$gene
+SS_genes = (SS_tbl %>%
+              select(gene, 
+                     contains(paste("padj_", transition, sep = "")),
+                     contains(paste("log2FC_", transition, sep = ""))) %>%
+              filter_(paste("padj_", transition, " < 0.1", sep = "")) %>%
+              filter_(paste("abs(log2FC_", transition, ") > 1", sep = "")))$gene
+
+SS_TR_overlap = length(intersect(TR_genes, SS_genes))
+SS_alone = length(SS_genes) - length(intersect(TR_genes, SS_genes))
+TR_alone = length(TR_genes) - length(intersect(TR_genes, SS_genes))
+plot(venneuler::venneuler(c(TR = TR_alone, SS = SS_alone, "SS&TR" = SS_TR_overlap)))
+```
+
+
+
+
+
+
+
